@@ -1,0 +1,11 @@
+# Handmade Leather Products - Business Data Management (BDM) Platform
+# Core Backend Dependencies
+
+flask>=3.0.0
+gunicorn>=21.2.0
+psycopg2-binary>=2.9.9
+python-dotenv>=1.0.0
+requests>=2.31.0
+pandas>=2.0.0
+numpy>=1.24.0
+tabulate>=0.9.0
