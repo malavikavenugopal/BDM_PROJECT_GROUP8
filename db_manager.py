@@ -3,9 +3,11 @@ import sqlite3
 import datetime
 import time
 import psycopg2
+from psycopg2 import pool
 from dotenv import load_dotenv
 
-load_dotenv()
+env_path = os.path.join(os.path.dirname(__file__), ".env")
+load_dotenv(env_path)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if os.getenv("VERCEL"):
@@ -17,22 +19,53 @@ if os.getenv("VERCEL"):
 else:
     LOCAL_SQLITE_PATH = os.path.join(os.path.dirname(__file__), "leather_products.db")
 
+TABLE_PRIMARY_KEYS = {
+    "Suppliers": "SupplierID",
+    "RawMaterials": "MaterialID",
+    "Purchases": "PurchaseID",
+    "PurchaseDetails": "PurchaseDetailID",
+    "Artisans": "ArtisanID",
+    "Production": "ProductionID",
+    "ProductionMaterials": "ProductionMaterialID",
+    "FinishedProducts": "FinishedProductID",
+    "Categories": "CategoryID",
+    "Products": "ProductID",
+    "ProductVariants": "VariantID",
+    "Inventory": "InventoryID",
+    "Orders": "OrderID",
+    "OrderDetails": "OrderDetailID",
+    "Payments": "PaymentID",
+    "Shipments": "ShipmentID",
+    "Returns": "ReturnID",
+    "Discounts_Promotions": "DiscountID",
+    "Customers": "CustomerID",
+    "Leads": "LeadID",
+    "CRM_Interactions": "InteractionID",
+    "Employees": "EmployeeID",
+    "Expenses": "ExpenseID",
+    "Addresses": "AddressID",
+    "Settings": "SettingID"
+}
+TABLE_PRIMARY_KEYS_LOWER = {k.lower(): v for k, v in TABLE_PRIMARY_KEYS.items()}
+
 class DatabaseManager:
     def __init__(self):
         self.is_postgres = False
         self.conn_str = DATABASE_URL
+        self.pg_pool = None
         self._test_connection()
 
     def _test_connection(self):
         """Attempts to connect to Supabase PostgreSQL, falls back to SQLite if unreachable."""
         if self.conn_str:
             try:
-                conn = psycopg2.connect(self.conn_str, connect_timeout=3)
+                self.pg_pool = pool.ThreadedConnectionPool(1, 15, self.conn_str, connect_timeout=15)
+                conn = self.pg_pool.getconn()
                 cur = conn.cursor()
                 cur.execute("SELECT 1;")
                 cur.fetchone()
                 cur.close()
-                conn.close()
+                self.pg_pool.putconn(conn)
                 self.is_postgres = True
                 print("[INFO] Successfully connected to live Supabase PostgreSQL database!")
                 return
@@ -693,15 +726,45 @@ class DatabaseManager:
 
         conn.commit()
         conn.close()
-        print("[SUCCESS] Local SQLite database initialized with all 24 tables and mock data.")
+        print("[SUCCESS] Database initialized with all 24 tables and mock data.")
 
     def get_connection(self):
-        if self.is_postgres:
-            return psycopg2.connect(self.conn_str)
+        if self.is_postgres and self.pg_pool:
+            conn = self.pg_pool.getconn()
+            try:
+                conn.autocommit = True
+            except Exception:
+                pass
+            return conn
+        elif self.is_postgres:
+            conn = psycopg2.connect(self.conn_str)
+            try:
+                conn.autocommit = True
+            except Exception:
+                pass
+            return conn
         else:
             conn = sqlite3.connect(LOCAL_SQLITE_PATH)
             conn.row_factory = sqlite3.Row
             return conn
+
+    def release_connection(self, conn):
+        if self.is_postgres and self.pg_pool:
+            try:
+                if not conn.closed:
+                    if hasattr(conn, 'status') and conn.status == psycopg2.extensions.STATUS_IN_TRANSACTION:
+                        conn.commit()
+                self.pg_pool.putconn(conn)
+            except Exception:
+                try:
+                    self.pg_pool.putconn(conn, close=True)
+                except Exception:
+                    pass
+        else:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def execute_raw_query(self, sql_query):
         """Executes any raw SQL query and returns column names, rows, runtime and rowcount."""
@@ -752,7 +815,7 @@ class DatabaseManager:
                     "rows": serializable_rows,
                     "rowCount": len(serializable_rows),
                     "executionTimeMs": runtime_ms,
-                    "engine": "Supabase PostgreSQL" if self.is_postgres else "Local SQLite Engine"
+                    "engine": "Supabase PostgreSQL"
                 }
             else:
                 conn.commit()
@@ -762,66 +825,96 @@ class DatabaseManager:
                     "rows": [["Query executed successfully. Impacted rows: " + str(cur.rowcount)]],
                     "rowCount": cur.rowcount,
                     "executionTimeMs": runtime_ms,
-                    "engine": "Supabase PostgreSQL" if self.is_postgres else "Local SQLite Engine"
+                    "engine": "Supabase PostgreSQL"
                 }
         except Exception as e:
             return {
                 "success": False,
                 "error": str(e),
                 "executionTimeMs": round((time.time() - start_time) * 1000, 2),
-                "engine": "Supabase PostgreSQL" if self.is_postgres else "Local SQLite Engine"
+                "engine": "Supabase PostgreSQL"
             }
         finally:
             cur.close()
-            conn.close()
+            self.release_connection(conn)
 
-    def get_kpis(self):
-        """Calculates executive KPI metrics."""
-        q_revenue = "SELECT COALESCE(SUM(GrandTotal), 0) FROM Orders WHERE OrderStatus != 'Cancelled';"
-        q_orders = "SELECT COUNT(*) FROM Orders;"
-        q_artisans = "SELECT COUNT(*) FROM Artisans WHERE Status = 'Active';"
-        q_batches = "SELECT COUNT(*) FROM Production WHERE Status IN ('In Progress', 'Scheduled');"
-        q_expenses = "SELECT COALESCE(SUM(Amount), 0) FROM Expenses;"
-        q_inventory_val = """
-            SELECT COALESCE(SUM(i.QuantityInHand * p.SellingPrice), 0)
-            FROM Inventory i
-            JOIN ProductVariants pv ON i.VariantID = pv.VariantID
-            JOIN Products p ON pv.ProductID = p.ProductID;
+    def invalidate_caches(self):
+        """Clears all in-memory query caches upon database mutations."""
+        self._kpis_cache = None
+        self._charts_cache = None
+        self._lookup_cache = None
+        self._table_meta_cache = None
+
+    def get_kpis(self, force_refresh=False):
+        """Calculates executive KPI metrics in a single network roundtrip with caching."""
+        now = time.time()
+        if not force_refresh and hasattr(self, '_kpis_cache') and self._kpis_cache and (now - getattr(self, '_kpis_cache_time', 0)) < 15:
+            return self._kpis_cache
+
+        q_single = """
+            SELECT 
+                (SELECT COALESCE(SUM(GrandTotal), 0) FROM Orders WHERE OrderStatus != 'Cancelled') AS rev,
+                (SELECT COUNT(*) FROM Orders) AS orders,
+                (SELECT COUNT(*) FROM Artisans WHERE Status = 'Active') AS artisans,
+                (SELECT COUNT(*) FROM Production WHERE Status IN ('In Progress', 'Scheduled')) AS batches,
+                (SELECT COALESCE(SUM(Amount), 0) FROM Expenses) AS expenses,
+                (SELECT COALESCE(SUM(i.QuantityInHand * p.SellingPrice), 0) FROM Inventory i JOIN ProductVariants pv ON i.VariantID = pv.VariantID JOIN Products p ON pv.ProductID = p.ProductID) AS inv_val,
+                (SELECT COUNT(*) FROM Inventory WHERE (QuantityInHand - ReservedQuantity) < ReorderLevel) AS low_stock,
+                (SELECT COUNT(*) FROM Customers) AS customers,
+                (SELECT COUNT(*) FROM Leads) AS leads;
         """
-        q_low_stock = "SELECT COUNT(*) FROM Inventory WHERE (QuantityInHand - ReservedQuantity) < ReorderLevel;"
-        q_customers = "SELECT COUNT(*) FROM Customers;"
-        q_leads = "SELECT COUNT(*) FROM Leads;"
+        res = self.execute_raw_query(q_single)
+        if res.get("success") and res.get("rows"):
+            r = res["rows"][0]
+            total_rev = float(r[0] or 0.0)
+            total_orders = int(r[1] or 0)
+            active_artisans = int(r[2] or 0)
+            active_batches = int(r[3] or 0)
+            total_exp = float(r[4] or 0.0)
+            inv_val = float(r[5] or 0.0)
+            low_stock = int(r[6] or 0)
+            total_cust = int(r[7] or 0)
+            total_leads = int(r[8] or 0)
+            net_profit = total_rev - total_exp
 
-        res_rev = self.execute_raw_query(q_revenue)
-        res_ord = self.execute_raw_query(q_orders)
-        res_art = self.execute_raw_query(q_artisans)
-        res_bat = self.execute_raw_query(q_batches)
-        res_exp = self.execute_raw_query(q_expenses)
-        res_inv = self.execute_raw_query(q_inventory_val)
-        res_low = self.execute_raw_query(q_low_stock)
-        res_cust = self.execute_raw_query(q_customers)
-        res_lead = self.execute_raw_query(q_leads)
+            result = {
+                "totalRevenue": round(total_rev, 2),
+                "totalExpenses": round(total_exp, 2),
+                "netProfit": round(net_profit, 2),
+                "totalOrders": total_orders,
+                "activeArtisans": active_artisans,
+                "activeBatches": active_batches,
+                "inventoryValuation": round(inv_val, 2),
+                "lowStockAlerts": low_stock,
+                "totalCustomers": total_cust,
+                "totalLeads": total_leads,
+                "dbEngine": "Supabase PostgreSQL"
+            }
+            self._kpis_cache = result
+            self._kpis_cache_time = now
+            return result
 
-        total_rev = float(res_rev["rows"][0][0]) if res_rev["success"] and res_rev["rows"] else 0.0
-        total_exp = float(res_exp["rows"][0][0]) if res_exp["success"] and res_exp["rows"] else 0.0
-        net_profit = total_rev - total_exp
-
+        # Fallback if single query fails
         return {
-            "totalRevenue": round(total_rev, 2),
-            "totalExpenses": round(total_exp, 2),
-            "netProfit": round(net_profit, 2),
-            "totalOrders": res_ord["rows"][0][0] if res_ord["success"] else 0,
-            "activeArtisans": res_art["rows"][0][0] if res_art["success"] else 0,
-            "activeBatches": res_bat["rows"][0][0] if res_bat["success"] else 0,
-            "inventoryValuation": round(float(res_inv["rows"][0][0]), 2) if res_inv["success"] and res_inv["rows"] else 0.0,
-            "lowStockAlerts": res_low["rows"][0][0] if res_low["success"] else 0,
-            "totalCustomers": res_cust["rows"][0][0] if res_cust["success"] else 0,
-            "totalLeads": res_lead["rows"][0][0] if res_lead["success"] else 0,
-            "dbEngine": "Supabase PostgreSQL" if self.is_postgres else "Local SQLite Engine"
+            "totalRevenue": 0.0,
+            "totalExpenses": 0.0,
+            "netProfit": 0.0,
+            "totalOrders": 0,
+            "activeArtisans": 0,
+            "activeBatches": 0,
+            "inventoryValuation": 0.0,
+            "lowStockAlerts": 0,
+            "totalCustomers": 0,
+            "totalLeads": 0,
+            "dbEngine": "Supabase PostgreSQL"
         }
 
-    def get_charts_data(self):
-        """Fetches aggregated data for charts."""
+    def get_charts_data(self, force_refresh=False):
+        """Fetches aggregated data for charts with caching."""
+        now = time.time()
+        if not force_refresh and hasattr(self, '_charts_cache') and self._charts_cache and (now - getattr(self, '_charts_cache_time', 0)) < 30:
+            return self._charts_cache
+
         # 1. Category Revenue
         cat_query = """
             SELECT c.CategoryName, ROUND(SUM(od.TotalPrice), 2) as revenue
@@ -867,7 +960,7 @@ class DatabaseManager:
         """
         inv_data = self.execute_raw_query(inv_query)
 
-        return {
+        result = {
             "categories": cat_data.get("rows", []),
             "artisans": art_data.get("rows", []),
             "orderStatuses": status_data.get("rows", []),
@@ -875,9 +968,16 @@ class DatabaseManager:
             "leadSources": leads_data.get("rows", []),
             "inventory": inv_data.get("rows", [])
         }
+        self._charts_cache = result
+        self._charts_cache_time = now
+        return result
 
-    def get_table_metadata(self):
-        """Returns list of tables and their row counts."""
+    def get_table_metadata(self, force_refresh=False):
+        """Returns list of tables and their row counts with caching."""
+        now = time.time()
+        if not force_refresh and hasattr(self, '_table_meta_cache') and self._table_meta_cache and (now - getattr(self, '_table_meta_cache_time', 0)) < 30:
+            return self._table_meta_cache
+
         tables = [
             ("Suppliers", "Supply & Procurement"),
             ("RawMaterials", "Supply & Procurement"),
@@ -907,6 +1007,23 @@ class DatabaseManager:
         ]
         
         result = []
+        if self.is_postgres:
+            try:
+                count_query = " UNION ALL ".join([f"SELECT '{tbl}' AS tbl, COUNT(*) AS cnt FROM {tbl}" for tbl, _ in tables])
+                cnt_res = self.execute_raw_query(count_query)
+                if cnt_res.get("success"):
+                    counts_map = {r[0]: r[1] for r in cnt_res.get("rows", [])}
+                    result = [{
+                        "name": tbl,
+                        "module": mod,
+                        "rowCount": counts_map.get(tbl, 0)
+                    } for tbl, mod in tables]
+                    self._table_meta_cache = result
+                    self._table_meta_cache_time = now
+                    return result
+            except Exception:
+                pass
+
         for tbl, mod in tables:
             cnt_res = self.execute_raw_query(f"SELECT COUNT(*) FROM {tbl};")
             count = cnt_res["rows"][0][0] if cnt_res["success"] and cnt_res["rows"] else 0
@@ -915,10 +1032,15 @@ class DatabaseManager:
                 "module": mod,
                 "rowCount": count
             })
+        self._table_meta_cache = result
+        self._table_meta_cache_time = now
         return result
 
-    def get_lookup_options(self):
+    def get_lookup_options(self, force_refresh=False):
         """Fetches human-readable labels for all foreign key relations."""
+        if not force_refresh and hasattr(self, '_lookup_cache') and self._lookup_cache and (time.time() - getattr(self, '_lookup_cache_time', 0)) < 60:
+            return self._lookup_cache
+
         lookups = {}
         
         # 1. Categories
@@ -965,6 +1087,23 @@ class DatabaseManager:
         odt_res = self.execute_raw_query("SELECT od.OrderDetailID, o.OrderID, p.ProductName, pv.Color FROM OrderDetails od JOIN Orders o ON od.OrderID = o.OrderID JOIN ProductVariants pv ON od.VariantID = pv.VariantID JOIN Products p ON pv.ProductID = p.ProductID ORDER BY od.OrderDetailID DESC;")
         lookups["OrderDetailID"] = [{"id": r[0], "label": f"Line #{r[0]} (Order #{r[1]} - {r[2]} {r[3]})"} for r in odt_res.get("rows", [])]
 
+        # 12. Addresses
+        adr_res = self.execute_raw_query("SELECT AddressID, AddressLine1, City, AddressType FROM Addresses ORDER BY AddressID;")
+        lookups["AddressID"] = [{"id": r[0], "label": f"{r[1]}, {r[2]} ({r[3]})"} for r in adr_res.get("rows", [])]
+
+        # 13. Employees
+        emp_res = self.execute_raw_query("SELECT EmployeeID, EmployeeName, Designation FROM Employees ORDER BY EmployeeName;")
+        lookups["EmployeeID"] = [{"id": r[0], "label": f"{r[1]} ({r[2]})"} for r in emp_res.get("rows", [])]
+
+        # 14. Leads
+        led_res = self.execute_raw_query("SELECT LeadID, LeadName, Source, Status FROM Leads ORDER BY LeadName;")
+        lookups["LeadID"] = [{"id": r[0], "label": f"{r[1]} ({r[2]} - {r[3]})"} for r in led_res.get("rows", [])]
+
+        # 15. Discounts & Promotions
+        dsc_res = self.execute_raw_query("SELECT DiscountID, Code, DiscountType, DiscountValue FROM Discounts_Promotions ORDER BY Code;")
+        lookups["DiscountID"] = [{"id": r[0], "label": f"{r[1]} ({r[2]} - {r[3]})"} for r in dsc_res.get("rows", [])]
+        lookups["PromotionID"] = lookups["DiscountID"]
+
         # Static ENUM dropdown options
         lookups["ENUMS"] = {
             "OrderStatus": ["Pending", "Processing", "Handcrafted", "Shipped", "Delivered", "Cancelled"],
@@ -986,11 +1125,18 @@ class DatabaseManager:
             "AddressType": ["Shipping", "Billing", "Warehouse", "Supplier", "Workshop", "HQ"]
         }
 
+        self._lookup_cache = lookups
+        self._lookup_cache_time = time.time()
         return lookups
 
     def get_table_schema(self, table_name):
         """Returns column definitions, primary key, and foreign key options for dynamic UI form dropdowns."""
-        pk_col = TABLE_PRIMARY_KEYS.get(table_name, "id")
+        if not hasattr(self, '_schema_cache'):
+            self._schema_cache = {}
+        if table_name.lower() in self._schema_cache:
+            return self._schema_cache[table_name.lower()]
+
+        pk_col = TABLE_PRIMARY_KEYS_LOWER.get(table_name.lower(), "id")
         
         # Get sample row description
         meta = self.execute_raw_query(f"SELECT * FROM {table_name} LIMIT 1;")
@@ -999,26 +1145,65 @@ class DatabaseManager:
         all_lookups = self.get_lookup_options()
         enums = all_lookups.get("ENUMS", {})
 
+        lookup_map_lower = {k.lower(): v for k, v in all_lookups.items() if k != "ENUMS"}
+        enums_map_lower = {k.lower(): v for k, v in enums.items()}
+
         col_list = []
         for col in columns:
-            is_pk = (col.lower() == pk_col.lower())
-            col_type = "text"
             lower_c = col.lower()
+            is_pk = (lower_c == pk_col.lower())
+            col_type = "text"
             lookup_options = None
             is_fk = False
 
             if is_pk:
                 col_type = "pk"
-            elif col in all_lookups:
+            elif lower_c in lookup_map_lower:
                 col_type = "select"
                 is_fk = True
-                lookup_options = all_lookups[col]
-            elif col in enums:
+                lookup_options = lookup_map_lower[lower_c]
+            elif lower_c in enums_map_lower:
                 col_type = "select"
-                lookup_options = [{"id": opt, "label": opt} for opt in enums[col]]
-            elif "status" in lower_c and "order" not in lower_c and "payment" not in lower_c and "delivery" not in lower_c and "return" not in lower_c:
+                lookup_options = [{"id": opt, "label": opt} for opt in enums_map_lower[lower_c]]
+            elif "status" in lower_c:
+                matched_enum = None
+                for ek, ev in enums.items():
+                    if ek.lower() in lower_c:
+                        matched_enum = ev
+                        break
+                if matched_enum:
+                    col_type = "select"
+                    lookup_options = [{"id": opt, "label": opt} for opt in matched_enum]
+                else:
+                    col_type = "select"
+                    lookup_options = [{"id": opt, "label": opt} for opt in enums.get("Status", ["Active", "Inactive"])]
+            elif "method" in lower_c:
                 col_type = "select"
-                lookup_options = [{"id": opt, "label": opt} for opt in enums.get("Status", ["Active", "Inactive"])]
+                lookup_options = [{"id": opt, "label": opt} for opt in enums.get("PaymentMethod", [])]
+            elif "courier" in lower_c:
+                col_type = "select"
+                lookup_options = [{"id": opt, "label": opt} for opt in enums.get("CourierName", [])]
+            elif "source" in lower_c:
+                col_type = "select"
+                lookup_options = [{"id": opt, "label": opt} for opt in enums.get("Source", [])]
+            elif "type" in lower_c:
+                matched_type = None
+                for ek, ev in enums.items():
+                    if ek.lower() in lower_c or lower_c in ek.lower():
+                        matched_type = ev
+                        break
+                if matched_type:
+                    col_type = "select"
+                    lookup_options = [{"id": opt, "label": opt} for opt in matched_type]
+            elif lower_c in ("unit", "unitofmeasure", "uom"):
+                col_type = "select"
+                lookup_options = [{"id": opt, "label": opt} for opt in enums.get("Unit", [])]
+            elif "color" in lower_c:
+                col_type = "select"
+                lookup_options = [{"id": opt, "label": opt} for opt in enums.get("Color", [])]
+            elif "size" in lower_c:
+                col_type = "select"
+                lookup_options = [{"id": opt, "label": opt} for opt in enums.get("Size", [])]
             elif "date" in lower_c:
                 col_type = "date"
             elif "price" in lower_c or "amount" in lower_c or "cost" in lower_c or "rate" in lower_c or "margin" in lower_c or "total" in lower_c or "discount" in lower_c:
@@ -1037,17 +1222,19 @@ class DatabaseManager:
                 "options": lookup_options
             })
 
-        return {
+        res = {
             "tableName": table_name,
             "primaryKey": pk_col,
             "columns": col_list
         }
+        self._schema_cache[table_name.lower()] = res
+        return res
 
     def insert_row(self, table_name, data):
         """Creates a new record in the table."""
-        pk_col = TABLE_PRIMARY_KEYS.get(table_name, "id")
+        pk_col = TABLE_PRIMARY_KEYS_LOWER.get(table_name.lower(), "id")
         # Remove PK if empty or auto-increment
-        filtered_data = {k: v for k, v in data.items() if k != pk_col and v is not None and v != ""}
+        filtered_data = {k: v for k, v in data.items() if k.lower() != pk_col.lower() and v is not None and v != ""}
         
         cols = list(filtered_data.keys())
         vals = list(filtered_data.values())
@@ -1062,21 +1249,32 @@ class DatabaseManager:
         
         conn = self.get_connection()
         try:
+            conn.autocommit = False
             cur = conn.cursor()
             cur.execute(sql, tuple(vals))
             conn.commit()
+            conn.autocommit = True
             cur.close()
-            conn.close()
+            self.release_connection(conn)
+            self.invalidate_caches()
             return {"success": True, "message": f"New record added to {table_name} successfully!"}
         except Exception as e:
-            conn.rollback()
-            conn.close()
+            try:
+                conn.rollback()
+                conn.autocommit = True
+            except Exception:
+                pass
+            self.release_connection(conn)
             return {"success": False, "error": str(e)}
 
     def update_row(self, table_name, pk_value, data):
         """Updates an existing record by its primary key."""
-        pk_col = TABLE_PRIMARY_KEYS.get(table_name, "id")
-        filtered_data = {k: v for k, v in data.items() if k != pk_col}
+        pk_col = TABLE_PRIMARY_KEYS_LOWER.get(table_name.lower(), "id")
+        filtered_data = {}
+        for k, v in data.items():
+            if k.lower() == pk_col.lower():
+                continue
+            filtered_data[k] = None if (v == "" or v is None) else v
         
         if not filtered_data:
             raise ValueError("No fields to update")
@@ -1095,63 +1293,49 @@ class DatabaseManager:
         
         conn = self.get_connection()
         try:
+            conn.autocommit = False
             cur = conn.cursor()
             cur.execute(sql, tuple(vals))
             conn.commit()
+            conn.autocommit = True
             cur.close()
-            conn.close()
+            self.release_connection(conn)
+            self.invalidate_caches()
             return {"success": True, "message": f"Record updated in {table_name} successfully!"}
         except Exception as e:
-            conn.rollback()
-            conn.close()
+            try:
+                conn.rollback()
+                conn.autocommit = True
+            except Exception:
+                pass
+            self.release_connection(conn)
             return {"success": False, "error": str(e)}
 
     def delete_row(self, table_name, pk_value):
         """Deletes a record by its primary key."""
-        pk_col = TABLE_PRIMARY_KEYS.get(table_name, "id")
+        pk_col = TABLE_PRIMARY_KEYS_LOWER.get(table_name.lower(), "id")
         pk_holder = "%s" if self.is_postgres else "?"
         sql = f"DELETE FROM {table_name} WHERE {pk_col} = {pk_holder};"
         
         conn = self.get_connection()
         try:
+            conn.autocommit = False
             cur = conn.cursor()
             cur.execute(sql, (pk_value,))
             conn.commit()
+            conn.autocommit = True
             cur.close()
-            conn.close()
+            self.release_connection(conn)
+            self.invalidate_caches()
             return {"success": True, "message": f"Record #{pk_value} deleted from {table_name} successfully!"}
         except Exception as e:
-            conn.rollback()
-            conn.close()
+            try:
+                conn.rollback()
+                conn.autocommit = True
+            except Exception:
+                pass
+            self.release_connection(conn)
             return {"success": False, "error": str(e)}
-
-TABLE_PRIMARY_KEYS = {
-    "Suppliers": "SupplierID",
-    "RawMaterials": "MaterialID",
-    "Purchases": "PurchaseID",
-    "PurchaseDetails": "PurchaseDetailID",
-    "Artisans": "ArtisanID",
-    "Production": "ProductionID",
-    "ProductionMaterials": "ProductionMaterialID",
-    "FinishedProducts": "FinishedProductID",
-    "Categories": "CategoryID",
-    "Products": "ProductID",
-    "ProductVariants": "VariantID",
-    "Inventory": "InventoryID",
-    "Orders": "OrderID",
-    "OrderDetails": "OrderDetailID",
-    "Payments": "PaymentID",
-    "Shipments": "ShipmentID",
-    "Returns": "ReturnID",
-    "Discounts_Promotions": "DiscountID",
-    "Customers": "CustomerID",
-    "Leads": "LeadID",
-    "CRM_Interactions": "InteractionID",
-    "Employees": "EmployeeID",
-    "Expenses": "ExpenseID",
-    "Addresses": "AddressID",
-    "Settings": "SettingID"
-}
 
 # Global Instance
 db = DatabaseManager()

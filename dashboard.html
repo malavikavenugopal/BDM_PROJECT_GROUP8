@@ -423,14 +423,16 @@
         }
 
         .badge-fk-label {
-            background: #F1F5F9;
-            border: 1px solid #E2E8F0;
-            color: var(--text-heading);
+            background: #EFF6FF;
+            border: 1px solid #BFDBFE;
+            color: #1D4ED8;
             font-weight: 600;
-            padding: 0.2rem 0.5rem;
+            padding: 0.22rem 0.6rem;
             border-radius: 6px;
             font-size: 0.8rem;
-            display: inline-block;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
         }
 
         .action-btns {
@@ -599,6 +601,49 @@
             gap: 0.75rem;
         }
 
+        /* FLOATING TOAST NOTIFICATION */
+        .toast-container {
+            position: fixed;
+            top: 24px;
+            right: 24px;
+            z-index: 9999;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            pointer-events: none;
+        }
+
+        .toast-alert {
+            pointer-events: auto;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            min-width: 320px;
+            max-width: 460px;
+            padding: 14px 18px;
+            border-radius: 12px;
+            background: #FFFFFF;
+            box-shadow: 0 12px 28px -5px rgba(15, 23, 42, 0.18), 0 8px 10px -6px rgba(15, 23, 42, 0.08);
+            border-left: 5px solid #10B981;
+            font-size: 0.88rem;
+            color: #0F172A;
+            animation: toastSlideIn 0.25s ease-out;
+            transition: all 0.3s ease;
+        }
+
+        .toast-alert.error {
+            border-left-color: #EF4444;
+        }
+
+        .toast-alert.info {
+            border-left-color: #2563EB;
+        }
+
+        @keyframes toastSlideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+
         /* KPI & CHARTS */
         .kpi-grid {
             display: grid;
@@ -723,6 +768,8 @@
     </style>
 </head>
 <body>
+    <!-- TOAST ALERTS -->
+    <div id="toastContainer" class="toast-container"></div>
     <!-- HEADER -->
     <header>
         <div class="brand-box">
@@ -824,8 +871,8 @@
                         <span class="kpi-label">Gross Revenue</span>
                         <div class="kpi-icon-wrap icon-tan"><i data-lucide="dollar-sign" style="width: 20px;"></i></div>
                     </div>
-                    <div class="kpi-val" id="ov-revenue">$5,520.00</div>
-                    <div class="kpi-meta">12 Client Orders Placed</div>
+                    <div class="kpi-val" id="ov-revenue">--</div>
+                    <div class="kpi-meta" id="ov-orders-meta">Live Supabase Orders</div>
                 </div>
 
                 <div class="kpi-card">
@@ -833,7 +880,7 @@
                         <span class="kpi-label">Average Order Value</span>
                         <div class="kpi-icon-wrap icon-blue"><i data-lucide="shopping-bag" style="width: 20px;"></i></div>
                     </div>
-                    <div class="kpi-val" id="ov-aov">$460.00</div>
+                    <div class="kpi-val" id="ov-aov">--</div>
                     <div class="kpi-meta">High-Ticket Luxury Leather</div>
                 </div>
 
@@ -842,7 +889,7 @@
                         <span class="kpi-label">Inventory Asset Value</span>
                         <div class="kpi-icon-wrap icon-emerald"><i data-lucide="layers" style="width: 20px;"></i></div>
                     </div>
-                    <div class="kpi-val" id="ov-inv">$101,095.00</div>
+                    <div class="kpi-val" id="ov-inv">--</div>
                     <div class="kpi-meta">Finished goods in warehouse</div>
                 </div>
 
@@ -851,7 +898,7 @@
                         <span class="kpi-label">Active Artisans</span>
                         <div class="kpi-icon-wrap icon-purple"><i data-lucide="users" style="width: 20px;"></i></div>
                     </div>
-                    <div class="kpi-val" id="ov-artisans">7</div>
+                    <div class="kpi-val" id="ov-artisans">--</div>
                     <div class="kpi-meta">Master Guild Craftsmen</div>
                 </div>
             </div>
@@ -987,18 +1034,30 @@
         let tableCols = [];
         let tableRows = [];
         let editingPkValue = null;
+        let schemaCache = {};
+        let tableDataCache = {};
+        let activeSwitchToken = 0;
+        let activeAbortController = null;
+        let searchDebounceTimer = null;
+        let catChartInstance = null;
+        let expChartInstance = null;
 
-        document.addEventListener("DOMContentLoaded", async () => {
+        document.addEventListener("DOMContentLoaded", () => {
             lucide.createIcons();
-            await loadGlobalLookups();
-            loadKpisAndCharts();
+            // Load components concurrently without blocking UI
             loadTablesMenu();
+            loadGlobalLookups();
+            loadKpisAndCharts();
         });
 
         async function loadGlobalLookups() {
             try {
                 const res = await fetch('/api/lookups');
                 globalLookups = await res.json();
+                // If a table is already displayed, refresh its readable labels
+                if (tableCols.length > 0 && tableRows.length > 0 && document.getElementById('crudTableContainer').querySelector('table')) {
+                    renderCrudTable(tableCols, tableRows);
+                }
             } catch (err) {
                 console.error("Error loading lookups:", err);
             }
@@ -1007,9 +1066,19 @@
         function switchNav(paneId) {
             document.querySelectorAll('.nav-tab-btn').forEach(b => b.classList.remove('active'));
             document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-            event.currentTarget.classList.add('active');
-            document.getElementById(`pane-${paneId}`).classList.add('active');
+            if (window.event && window.event.currentTarget && window.event.currentTarget.classList) {
+                window.event.currentTarget.classList.add('active');
+            } else {
+                const btn = document.querySelector(`.nav-tab-btn[onclick*="${paneId}"]`);
+                if (btn) btn.classList.add('active');
+            }
+            const targetPane = document.getElementById(`pane-${paneId}`);
+            if (targetPane) targetPane.classList.add('active');
             lucide.createIcons();
+            if (paneId === 'overview') {
+                loadKpisAndCharts();
+                window.dispatchEvent(new Event('resize'));
+            }
         }
 
         // LOAD KPIS & CHARTS
@@ -1017,109 +1086,264 @@
             try {
                 const res = await fetch('/api/kpis');
                 const data = await res.json();
-                document.getElementById('ov-revenue').innerText = `$${data.totalRevenue.toLocaleString()}`;
-                const aov = data.totalOrders > 0 ? (data.totalRevenue / data.totalOrders).toFixed(2) : 0;
-                document.getElementById('ov-aov').innerText = `$${aov}`;
-                document.getElementById('ov-inv').innerText = `$${data.inventoryValuation.toLocaleString()}`;
-                document.getElementById('ov-artisans').innerText = data.activeArtisans;
-                document.getElementById('dbBadge').innerText = `${data.dbEngine} Connected`;
+                document.getElementById('ov-revenue').innerText = `$${Number(data.totalRevenue || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+                const aov = data.totalOrders > 0 ? (data.totalRevenue / data.totalOrders).toFixed(2) : '0.00';
+                document.getElementById('ov-aov').innerText = `$${Number(aov).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+                document.getElementById('ov-inv').innerText = `$${Number(data.inventoryValuation || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+                document.getElementById('ov-artisans').innerText = data.activeArtisans || 0;
+                const engineName = (data.dbEngine || 'Supabase PostgreSQL').replace(/Local\s*/gi, '');
+                document.getElementById('dbBadge').innerText = `${engineName} Connected`;
 
                 const cRes = await fetch('/api/charts');
                 const cData = await cRes.json();
 
-                new Chart(document.getElementById('chartCatWhite'), {
-                    type: 'doughnut',
-                    data: {
-                        labels: cData.categories.map(c => c[0]),
-                        datasets: [{
-                            data: cData.categories.map(c => c[1]),
-                            backgroundColor: ['#C2672B', '#E5A93C', '#7C3AED', '#2563EB', '#059669', '#D97706'],
-                            borderWidth: 2,
-                            borderColor: '#FFFFFF'
-                        }]
-                    },
-                    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'right' } } }
-                });
+                if (catChartInstance) catChartInstance.destroy();
+                const catCanvas = document.getElementById('chartCatWhite');
+                if (catCanvas) {
+                    catChartInstance = new Chart(catCanvas, {
+                        type: 'doughnut',
+                        data: {
+                            labels: (cData.categories || []).map(c => c[0]),
+                            datasets: [{
+                                data: (cData.categories || []).map(c => c[1]),
+                                backgroundColor: ['#C2672B', '#E5A93C', '#7C3AED', '#2563EB', '#059669', '#D97706'],
+                                borderWidth: 2,
+                                borderColor: '#FFFFFF'
+                            }]
+                        },
+                        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'right' } } }
+                    });
+                }
 
-                new Chart(document.getElementById('chartExpWhite'), {
-                    type: 'bar',
-                    data: {
-                        labels: cData.expenses.map(e => e[0]),
-                        datasets: [{ label: 'Expense ($)', data: cData.expenses.map(e => e[1]), backgroundColor: '#C2672B', borderRadius: 6 }]
-                    },
-                    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
-                });
+                if (expChartInstance) expChartInstance.destroy();
+                const expCanvas = document.getElementById('chartExpWhite');
+                if (expCanvas) {
+                    expChartInstance = new Chart(expCanvas, {
+                        type: 'bar',
+                        data: {
+                            labels: (cData.expenses || []).map(e => e[0]),
+                            datasets: [{ label: 'Expense ($)', data: (cData.expenses || []).map(e => e[1]), backgroundColor: '#C2672B', borderRadius: 6 }]
+                        },
+                        options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
+                    });
+                }
 
             } catch (err) {
-                console.error(err);
+                console.error("Error loading KPIs/Charts:", err);
             }
         }
 
         // LOAD TABLES LIST
         async function loadTablesMenu() {
-            const res = await fetch('/api/tables');
-            const tables = await res.json();
-            const sidebar = document.getElementById('crudTableList');
+            try {
+                const res = await fetch('/api/tables');
+                const tables = await res.json();
+                const sidebar = document.getElementById('crudTableList');
 
-            const modules = {};
-            tables.forEach(t => {
-                if (!modules[t.module]) modules[t.module] = [];
-                modules[t.module].push(t);
-            });
-
-            let html = '';
-            for (const [mod, tbls] of Object.entries(modules)) {
-                html += `<div class="module-block"><div class="module-title">${mod}</div>`;
-                tbls.forEach(t => {
-                    const isActive = t.name === currentTable ? 'active' : '';
-                    html += `
-                        <button class="tbl-btn ${isActive}" onclick="selectTable('${t.name}')" id="btn-t-${t.name}">
-                            <span>${t.name}</span>
-                            <span class="pill-count">${t.rowCount}</span>
-                        </button>
-                    `;
+                const modules = {};
+                tables.forEach(t => {
+                    if (!modules[t.module]) modules[t.module] = [];
+                    modules[t.module].push(t);
                 });
-                html += `</div>`;
+
+                let html = '';
+                for (const [mod, tbls] of Object.entries(modules)) {
+                    html += `<div class="module-block"><div class="module-title">${mod}</div>`;
+                    tbls.forEach(t => {
+                        const isActive = t.name === currentTable ? 'active' : '';
+                        html += `
+                            <button class="tbl-btn ${isActive}" onclick="selectTable('${t.name}')" id="btn-t-${t.name}">
+                                <span>${t.name}</span>
+                                <span class="pill-count">${t.rowCount}</span>
+                            </button>
+                        `;
+                    });
+                    html += `</div>`;
+                }
+                sidebar.innerHTML = html;
+                
+                // Only select default table if no rows are loaded
+                if (tableRows.length === 0) {
+                    selectTable(currentTable);
+                }
+            } catch (err) {
+                console.error("Error loading tables menu:", err);
             }
-            sidebar.innerHTML = html;
-            selectTable(currentTable);
         }
 
+        // SWITCH TABLE - INSTANT CLEAR, PARALLEL FETCH, RACE-CONDITION GUARD & 0ms CLIENT CACHE
         async function selectTable(tblName) {
+            const switchToken = ++activeSwitchToken;
             currentTable = tblName;
+
+            // Highlight sidebar button immediately
             document.querySelectorAll('.tbl-btn').forEach(b => b.classList.remove('active'));
             const b = document.getElementById(`btn-t-${tblName}`);
             if (b) b.classList.add('active');
 
-            document.getElementById('currentTableName').innerText = tblName;
-            
-            // Load table schema with FK options
-            const sRes = await fetch(`/api/schema/${tblName}`);
-            tableSchema = await sRes.json();
+            // Set Title Immediately
+            document.getElementById('currentTableName').innerText = formatColumnTitle(tblName);
 
-            loadTableRecords();
+            // Abort previous in-flight fetch
+            if (activeAbortController) {
+                activeAbortController.abort();
+            }
+            activeAbortController = new AbortController();
+            const signal = activeAbortController.signal;
+
+            // INSTANT SWITCH: If cached, render immediately without spinner (0ms latency!)
+            if (tableDataCache[tblName] && schemaCache[tblName]) {
+                tableSchema = schemaCache[tblName];
+                tableCols = tableDataCache[tblName].columns;
+                tableRows = tableDataCache[tblName].rows;
+                document.getElementById('recordCountText').innerText = `${tableDataCache[tblName].rowCount} records saved in database`;
+                renderCrudTable(tableCols, tableRows);
+            } else {
+                // Otherwise clear previous data immediately and show clean loading spinner
+                tableCols = [];
+                tableRows = [];
+                document.getElementById('recordCountText').innerText = 'Loading live records...';
+                document.getElementById('crudTableContainer').innerHTML = `
+                    <div style="padding: 3.5rem; text-align: center; color: var(--text-muted);">
+                        <div style="display:inline-block; width: 28px; height: 28px; border: 3px solid rgba(194, 103, 43, 0.2); border-radius: 50%; border-top-color: var(--primary-accent); animation: spin 0.8s linear infinite; margin-bottom: 0.85rem;"></div>
+                        <div style="font-weight: 600; font-size: 0.95rem; color: var(--text-heading);">Loading ${formatColumnTitle(tblName)} data...</div>
+                        <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">Connecting to Supabase PostgreSQL</div>
+                    </div>
+                `;
+            }
+
+            // Parallel fetch: Schema (with memory cache) + Records
+            const schemaPromise = schemaCache[tblName] ? 
+                Promise.resolve(schemaCache[tblName]) : 
+                fetch(`/api/schema/${tblName}`, { signal }).then(r => r.json()).then(s => { schemaCache[tblName] = s; return s; });
+            
+            const recordsPromise = fetch(`/api/table/${tblName}`, { signal }).then(r => r.json());
+
+            try {
+                const [schemaData, recordsData] = await Promise.all([schemaPromise, recordsPromise]);
+                
+                // If user switched to another table while fetching, discard stale response
+                if (switchToken !== activeSwitchToken) return;
+
+                tableSchema = schemaData;
+                if (recordsData.success) {
+                    tableCols = recordsData.columns;
+                    tableRows = recordsData.rows;
+                    tableDataCache[tblName] = {
+                        columns: recordsData.columns,
+                        rows: recordsData.rows,
+                        rowCount: recordsData.rowCount,
+                        time: Date.now()
+                    };
+                    document.getElementById('recordCountText').innerText = `${recordsData.rowCount} records saved in database`;
+                    renderCrudTable(recordsData.columns, recordsData.rows);
+                } else {
+                    document.getElementById('crudTableContainer').innerHTML = `<div style="padding: 2.5rem; text-align: center; color: #DC2626;">Error: ${recordsData.error}</div>`;
+                }
+            } catch (err) {
+                if (err.name === 'AbortError' || switchToken !== activeSwitchToken) return;
+                document.getElementById('crudTableContainer').innerHTML = `<div style="padding: 2.5rem; text-align: center; color: #DC2626;">Network error loading ${tblName}.</div>`;
+            }
         }
 
         async function loadTableRecords(search = '') {
-            const res = await fetch(`/api/table/${currentTable}?search=${encodeURIComponent(search)}`);
-            const data = await res.json();
-            if (data.success) {
-                tableCols = data.columns;
-                tableRows = data.rows;
-                document.getElementById('recordCountText').innerText = `${data.rowCount} records saved in database`;
-                renderCrudTable(data.columns, data.rows);
+            const switchToken = ++activeSwitchToken;
+            document.getElementById('recordCountText').innerText = 'Updating records...';
+            try {
+                const searchParam = search ? `search=${encodeURIComponent(search)}&` : '';
+                const res = await fetch(`/api/table/${currentTable}?${searchParam}_t=${Date.now()}`, {
+                    cache: 'no-store'
+                });
+                const data = await res.json();
+                if (switchToken !== activeSwitchToken) return;
+                if (data.success) {
+                    tableCols = data.columns;
+                    tableRows = data.rows;
+                    if (!search) {
+                        tableDataCache[currentTable] = {
+                            columns: data.columns,
+                            rows: data.rows,
+                            rowCount: data.rowCount,
+                            time: Date.now()
+                        };
+                    }
+                    document.getElementById('recordCountText').innerText = `${data.rowCount} records saved in database`;
+                    renderCrudTable(data.columns, data.rows);
+                }
+            } catch (err) {
+                console.error(err);
             }
+        }
+
+        function formatColumnTitle(name) {
+            if (!name) return '';
+            const lower = name.toLowerCase();
+            const map = {
+                'customerid': 'Customer',
+                'orderid': 'Order',
+                'supplierid': 'Supplier',
+                'productid': 'Product',
+                'variantid': 'Product Variant',
+                'materialid': 'Raw Material',
+                'artisanid': 'Artisan',
+                'productionid': 'Production Batch',
+                'purchaseid': 'Purchase Order',
+                'orderdetailid': 'Order Detail Line',
+                'categoryid': 'Category',
+                'addressid': 'Address',
+                'employeeid': 'Employee',
+                'leadid': 'Sales Lead',
+                'discountid': 'Discount / Promo Code',
+                'promotionid': 'Discount / Promo Code',
+                'orderstatus': 'Order Status',
+                'paymentstatus': 'Payment Status',
+                'deliverystatus': 'Delivery Status',
+                'returnstatus': 'Return Status',
+                'paymentmethod': 'Payment Method',
+                'couriername': 'Courier Partner',
+                'expensetype': 'Expense Type',
+                'materialtype': 'Material Type',
+                'interactiontype': 'Interaction Type',
+                'addresstype': 'Address Type',
+                'grandtotal': 'Grand Total ($)',
+                'totalamount': 'Total Amount ($)',
+                'discountamount': 'Discount Amount ($)',
+                'shippingamount': 'Shipping Amount ($)',
+                'totalprice': 'Total Price ($)',
+                'unitprice': 'Unit Price ($)',
+                'unitcost': 'Unit Cost ($)',
+                'baseprice': 'Base Cost ($)',
+                'sellingprice': 'Selling Price ($)',
+                'productioncost': 'Production Cost ($)',
+                'refundamount': 'Refund Amount ($)',
+                'dailyrate': 'Daily Rate ($)',
+                'quantityproduced': 'Quantity Produced',
+                'quantityinhand': 'Quantity In Hand',
+                'quantityreserved': 'Reserved Quantity',
+                'reorderlevel': 'Reorder Level'
+            };
+            if (map[lower]) return map[lower];
+
+            let formatted = name.replace(/([A-Z])/g, ' $1').replace(/_/g, ' ').trim();
+            if (formatted.toLowerCase().endsWith(' id')) {
+                formatted = formatted.substring(0, formatted.length - 3).trim();
+            }
+            return formatted.replace(/\b\w/g, l => l.toUpperCase());
         }
 
         // HELPER TO MAP ID TO HUMAN-READABLE LABEL IN TABLE DISPLAY
         function getReadableLabelForCell(colName, val) {
             if (val === null || val === undefined) return '<span style="color: var(--text-light); font-style: italic;">NULL</span>';
             
-            // Check if column is a known Foreign Key
-            if (globalLookups && globalLookups[colName]) {
-                const match = globalLookups[colName].find(opt => String(opt.id) === String(val));
-                if (match) {
-                    return `<span class="badge-fk-label">${match.label}</span>`;
+            // Check if column is a known Foreign Key (case-insensitive)
+            if (globalLookups) {
+                const lowerCol = String(colName).toLowerCase();
+                const matchedKey = Object.keys(globalLookups).find(k => k.toLowerCase() === lowerCol);
+                if (matchedKey && Array.isArray(globalLookups[matchedKey])) {
+                    const match = globalLookups[matchedKey].find(opt => String(opt.id) === String(val));
+                    if (match) {
+                        return `<span class="badge-fk-label"><i data-lucide="link-2" style="width: 11px; height: 11px;"></i>${match.label}</span>`;
+                    }
                 }
             }
             return String(val);
@@ -1136,7 +1360,7 @@
             const pkIdx = cols.findIndex(c => c.toLowerCase() === pkCol.toLowerCase());
 
             let html = '<table><thead><tr>';
-            cols.forEach(c => { html += `<th>${c}</th>`; });
+            cols.forEach(c => { html += `<th>${formatColumnTitle(c)}</th>`; });
             html += '<th style="text-align: right;">Actions</th></tr></thead><tbody>';
 
             rows.forEach((r, rowIdx) => {
@@ -1166,11 +1390,16 @@
         }
 
         function refreshCurrentTable() {
+            delete tableDataCache[currentTable];
             loadGlobalLookups().then(() => loadTableRecords());
         }
 
         function handleCrudSearch(e) {
-            loadTableRecords(e.target.value);
+            clearTimeout(searchDebounceTimer);
+            const val = e.target.value;
+            searchDebounceTimer = setTimeout(() => {
+                loadTableRecords(val);
+            }, 250);
         }
 
         // OPEN CREATE MODAL WITH SELECT DROPDOWNS
@@ -1213,29 +1442,40 @@
                 const label = document.createElement('label');
                 label.className = 'form-label';
                 
-                let tagText = col.is_primary_key ? 'Primary Key' : (col.options ? 'Select Dropdown' : '');
+                const colLower = col.name.toLowerCase();
+                const titleText = formatColumnTitle(col.name);
+
+                let tagText = col.is_primary_key ? 'Primary Key' : (col.is_foreign_key ? '🔗 Connected Dropdown' : (col.options ? 'Select Dropdown' : ''));
                 
                 // Check if this column is an auto-calculated field
                 const isAutoCalc = (
-                    (currentTable === 'PurchaseDetails' && (col.name === 'TotalPrice' || col.name === 'Quantity' || col.name === 'UnitPrice')) ||
-                    (currentTable === 'OrderDetails' && (col.name === 'TotalPrice' || col.name === 'Discount' || col.name === 'Quantity' || col.name === 'UnitPrice')) ||
-                    (currentTable === 'Orders' && (col.name === 'GrandTotal' || col.name === 'TotalAmount' || col.name === 'DiscountAmount' || col.name === 'ShippingAmount')) ||
-                    (currentTable === 'FinishedProducts' && (col.name === 'ProductionCost' || col.name === 'QuantityProduced' || col.name === 'UnitCost')) ||
-                    (currentTable === 'Products' && (col.name === 'SellingPrice' || col.name === 'BasePrice'))
+                    (currentTable.toLowerCase() === 'purchasedetails' && (colLower === 'totalprice' || colLower === 'quantity' || colLower === 'unitprice')) ||
+                    (currentTable.toLowerCase() === 'orderdetails' && (colLower === 'totalprice' || colLower === 'discount' || colLower === 'quantity' || colLower === 'unitprice')) ||
+                    (currentTable.toLowerCase() === 'orders' && (colLower === 'grandtotal' || colLower === 'totalamount' || colLower === 'discountamount' || colLower === 'shippingamount')) ||
+                    (currentTable.toLowerCase() === 'finishedproducts' && (colLower === 'productioncost' || colLower === 'quantityproduced' || colLower === 'unitcost')) ||
+                    (currentTable.toLowerCase() === 'products' && (colLower === 'sellingprice' || colLower === 'baseprice'))
                 );
 
                 const isResultField = (
-                    (currentTable === 'PurchaseDetails' && col.name === 'TotalPrice') ||
-                    (currentTable === 'OrderDetails' && col.name === 'TotalPrice') ||
-                    (currentTable === 'Orders' && col.name === 'GrandTotal') ||
-                    (currentTable === 'FinishedProducts' && col.name === 'ProductionCost')
+                    (currentTable.toLowerCase() === 'purchasedetails' && colLower === 'totalprice') ||
+                    (currentTable.toLowerCase() === 'orderdetails' && colLower === 'totalprice') ||
+                    (currentTable.toLowerCase() === 'orders' && colLower === 'grandtotal') ||
+                    (currentTable.toLowerCase() === 'finishedproducts' && colLower === 'productioncost')
                 );
 
                 if (isResultField) {
                     tagText = '⚡ Auto-Calculated';
                 }
 
-                label.innerHTML = `<span>${col.name}</span>` + (tagText ? `<span class="form-label-tag" style="${isResultField ? 'background:#ECFDF5; color:#059669; border:1px solid #A7F3D0; font-weight:700;' : ''}">${tagText}</span>` : '');
+                let tagStyle = '';
+                if (isResultField) {
+                    tagStyle = 'background:#ECFDF5; color:#059669; border:1px solid #A7F3D0; font-weight:700;';
+                } else if (col.is_foreign_key) {
+                    tagStyle = 'background:#EFF6FF; color:#2563EB; border:1px solid #BFDBFE; font-weight:600;';
+                }
+
+                label.innerHTML = `<span>${titleText} <small style="color:var(--text-light); font-weight:normal;">(${col.name})</small></span>` + 
+                    (tagText ? `<span class="form-label-tag" style="${tagStyle}">${tagText}</span>` : '');
 
                 let inputEl;
 
@@ -1248,7 +1488,7 @@
 
                     const defaultOption = document.createElement('option');
                     defaultOption.value = '';
-                    defaultOption.innerText = `-- Select ${col.name} --`;
+                    defaultOption.innerText = `-- Choose ${titleText} --`;
                     inputEl.appendChild(defaultOption);
 
                     col.options.forEach(opt => {
@@ -1259,9 +1499,9 @@
                     });
 
                     if (existingRow) {
-                        const colIdx = tableCols.indexOf(col.name);
-                        if (colIdx >= 0 && existingRow[colIdx] !== null) {
-                            inputEl.value = existingRow[colIdx];
+                        const colIdx = tableCols.findIndex(c => c.toLowerCase() === colLower);
+                        if (colIdx >= 0 && existingRow[colIdx] !== null && existingRow[colIdx] !== undefined) {
+                            inputEl.value = String(existingRow[colIdx]);
                         }
                     }
                 } else {
@@ -1288,8 +1528,8 @@
                     }
 
                     if (existingRow) {
-                        const colIdx = tableCols.indexOf(col.name);
-                        inputEl.value = (colIdx >= 0 && existingRow[colIdx] !== null) ? existingRow[colIdx] : '';
+                        const colIdx = tableCols.findIndex(c => c.toLowerCase() === colLower);
+                        inputEl.value = (colIdx >= 0 && existingRow[colIdx] !== null && existingRow[colIdx] !== undefined) ? existingRow[colIdx] : '';
                         if (col.is_primary_key) inputEl.readOnly = true;
                     }
                 }
@@ -1325,12 +1565,27 @@
                 });
             };
 
+            const getField = (name) => {
+                const lower = name.toLowerCase();
+                return document.getElementById(`input_field_${name}`) || 
+                       document.getElementById(`input_field_${lower}`) ||
+                       document.querySelector(`[name="${name}" i]`);
+            };
+
+            const getHint = (name) => {
+                const lower = name.toLowerCase();
+                return document.getElementById(`calc_hint_${name}`) || 
+                       document.getElementById(`calc_hint_${lower}`);
+            };
+
+            const tbl = currentTable.toLowerCase();
+
             // 1. PurchaseDetails: Quantity * UnitPrice = TotalPrice
-            if (currentTable === 'PurchaseDetails') {
-                const qtyEl = document.getElementById('input_field_Quantity');
-                const unitPriceEl = document.getElementById('input_field_UnitPrice');
-                const totalEl = document.getElementById('input_field_TotalPrice');
-                const hintEl = document.getElementById('calc_hint_TotalPrice');
+            if (tbl === 'purchasedetails') {
+                const qtyEl = getField('Quantity');
+                const unitPriceEl = getField('UnitPrice');
+                const totalEl = getField('TotalPrice');
+                const hintEl = getHint('TotalPrice');
 
                 const calc = () => {
                     const q = parseFloat(qtyEl?.value) || 0;
@@ -1351,16 +1606,16 @@
 
                 bindEvents(qtyEl, calc);
                 bindEvents(unitPriceEl, calc);
-                calc(); // Run immediately on render
+                calc();
             }
 
             // 2. OrderDetails: (Quantity * UnitPrice) - Discount = TotalPrice
-            if (currentTable === 'OrderDetails') {
-                const qtyEl = document.getElementById('input_field_Quantity');
-                const unitPriceEl = document.getElementById('input_field_UnitPrice');
-                const discountEl = document.getElementById('input_field_Discount');
-                const totalEl = document.getElementById('input_field_TotalPrice');
-                const hintEl = document.getElementById('calc_hint_TotalPrice');
+            if (tbl === 'orderdetails') {
+                const qtyEl = getField('Quantity');
+                const unitPriceEl = getField('UnitPrice');
+                const discountEl = getField('Discount');
+                const totalEl = getField('TotalPrice');
+                const hintEl = getHint('TotalPrice');
 
                 const calc = () => {
                     const q = parseFloat(qtyEl?.value) || 0;
@@ -1384,16 +1639,16 @@
                 bindEvents(qtyEl, calc);
                 bindEvents(unitPriceEl, calc);
                 bindEvents(discountEl, calc);
-                calc(); // Run immediately
+                calc();
             }
 
             // 3. Orders: TotalAmount - DiscountAmount + ShippingAmount = GrandTotal
-            if (currentTable === 'Orders') {
-                const totalEl = document.getElementById('input_field_TotalAmount');
-                const discEl = document.getElementById('input_field_DiscountAmount');
-                const shipEl = document.getElementById('input_field_ShippingAmount');
-                const grandEl = document.getElementById('input_field_GrandTotal');
-                const hintEl = document.getElementById('calc_hint_GrandTotal');
+            if (tbl === 'orders') {
+                const totalEl = getField('TotalAmount');
+                const discEl = getField('DiscountAmount');
+                const shipEl = getField('ShippingAmount');
+                const grandEl = getField('GrandTotal');
+                const hintEl = getHint('GrandTotal');
 
                 const calc = () => {
                     const t = parseFloat(totalEl?.value) || 0;
@@ -1416,15 +1671,15 @@
                 bindEvents(totalEl, calc);
                 bindEvents(discEl, calc);
                 bindEvents(shipEl, calc);
-                calc(); // Run immediately
+                calc();
             }
 
             // 4. FinishedProducts: QuantityProduced * UnitCost = ProductionCost
-            if (currentTable === 'FinishedProducts') {
-                const qtyEl = document.getElementById('input_field_QuantityProduced');
-                const unitCostEl = document.getElementById('input_field_UnitCost');
-                const prodCostEl = document.getElementById('input_field_ProductionCost');
-                const hintEl = document.getElementById('calc_hint_ProductionCost');
+            if (tbl === 'finishedproducts') {
+                const qtyEl = getField('QuantityProduced');
+                const unitCostEl = getField('UnitCost');
+                const prodCostEl = getField('ProductionCost');
+                const hintEl = getHint('ProductionCost');
 
                 const calc = () => {
                     const q = parseFloat(qtyEl?.value) || 0;
@@ -1445,13 +1700,13 @@
 
                 bindEvents(qtyEl, calc);
                 bindEvents(unitCostEl, calc);
-                calc(); // Run immediately
+                calc();
             }
 
             // 5. Products: BasePrice & SellingPrice -> live margin feedback
-            if (currentTable === 'Products') {
-                const baseEl = document.getElementById('input_field_BasePrice');
-                const sellEl = document.getElementById('input_field_SellingPrice');
+            if (tbl === 'products') {
+                const baseEl = getField('BasePrice');
+                const sellEl = getField('SellingPrice');
 
                 const calcMargin = () => {
                     const base = parseFloat(baseEl?.value) || 0;
@@ -1479,7 +1734,6 @@
 
                 bindEvents(baseEl, calcMargin);
                 bindEvents(sellEl, calcMargin);
-                calcMargin();
             }
 
             // 6. Generic Universal Fallback Calculation for any other table with Quantity * Price = Total
@@ -1507,6 +1761,33 @@
                 bindEvents(pIn, genericCalc);
                 genericCalc();
             }
+        }
+
+        function showNotification(message, type = 'success') {
+            const container = document.getElementById('toastContainer');
+            if (container) {
+                const toast = document.createElement('div');
+                toast.className = `toast-alert ${type}`;
+                const iconName = type === 'error' ? 'alert-triangle' : (type === 'info' ? 'info' : 'check-circle');
+                const iconColor = type === 'error' ? '#EF4444' : (type === 'info' ? '#2563EB' : '#10B981');
+                
+                toast.innerHTML = `
+                    <div style="color: ${iconColor}; display: flex; align-items: center;"><i data-lucide="${iconName}" style="width: 20px; height: 20px;"></i></div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 700; font-size: 0.92rem; color: #0F172A;">${type === 'error' ? 'Operation Failed' : 'Operation Successful'}</div>
+                        <div style="font-size: 0.82rem; color: #475569; margin-top: 2px;">${message}</div>
+                    </div>
+                    <button onclick="this.parentElement.remove()" style="background:none; border:none; color:#94A3B8; cursor:pointer; font-size:1.1rem; line-height:1; padding:2px;">&times;</button>
+                `;
+                container.appendChild(toast);
+                lucide.createIcons();
+                setTimeout(() => {
+                    toast.style.opacity = '0';
+                    toast.style.transform = 'translateX(100%)';
+                    setTimeout(() => toast.remove(), 300);
+                }, 4000);
+            }
+            alert((type === 'error' ? '❌ Error: ' : '✅ Success: ') + message);
         }
 
         // SAVE / SUBMIT RECORD
@@ -1545,15 +1826,17 @@
                 const result = await res.json();
                 if (result.success) {
                     closeCrudModal();
-                    await loadGlobalLookups();
-                    loadTableRecords();
+                    tableDataCache = {};
+                    await loadTableRecords();
+                    loadGlobalLookups();
                     loadTablesMenu();
                     loadKpisAndCharts();
+                    showNotification(result.message || (editingPkValue ? `Record #${editingPkValue} updated successfully!` : `New record added to ${currentTable} successfully!`), 'success');
                 } else {
-                    alert('Error saving record: ' + (result.error || 'Unknown error'));
+                    showNotification(result.error || 'Failed to save record', 'error');
                 }
             } catch (err) {
-                alert('Connection error: ' + err);
+                showNotification('Connection error: ' + err, 'error');
             }
         }
 
@@ -1569,15 +1852,17 @@
                 });
                 const result = await res.json();
                 if (result.success) {
-                    await loadGlobalLookups();
-                    loadTableRecords();
+                    tableDataCache = {};
+                    await loadTableRecords();
+                    loadGlobalLookups();
                     loadTablesMenu();
                     loadKpisAndCharts();
+                    showNotification(result.message || `Record #${pkVal} deleted from ${currentTable} successfully!`, 'success');
                 } else {
-                    alert('Error deleting record: ' + (result.error || 'Unknown error'));
+                    showNotification(result.error || 'Failed to delete record', 'error');
                 }
             } catch (err) {
-                alert('Connection error: ' + err);
+                showNotification('Connection error: ' + err, 'error');
             }
         }
 
@@ -1595,6 +1880,7 @@
             document.body.appendChild(link);
             link.click();
             document.body.removeChild(link);
+            showNotification(`Exported ${tableRows.length} records to CSV file!`, 'success');
         }
 
         // AD-HOC SQL
@@ -1621,12 +1907,15 @@
                     });
                     html += '</tbody></table>';
                     container.innerHTML = html;
+                    showNotification(`SQL Query executed successfully! (${data.rowCount} rows returned in ${data.executionTimeMs} ms)`, 'success');
                 } else {
                     document.getElementById('sqlStatusText').innerText = 'Error';
                     document.getElementById('sqlTableContainer').innerHTML = `<div style="padding: 2rem; color: #DC2626;">${data.error}</div>`;
+                    showNotification(data.error || 'SQL Query failed', 'error');
                 }
             } catch (err) {
                 console.error(err);
+                showNotification('Connection error executing query: ' + err, 'error');
             }
         }
     </script>

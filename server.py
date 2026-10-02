@@ -1,9 +1,13 @@
 import os
 import json
-from flask import Flask, render_template, request, jsonify, send_from_directory
-from db_manager import db
+from flask import Flask, render_template, request, jsonify
+from db_manager import db, TABLE_PRIMARY_KEYS
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
+VALID_TABLES_MAP = {k.lower(): k for k in TABLE_PRIMARY_KEYS.keys()}
+
+def get_valid_table_name(tbl):
+    return VALID_TABLES_MAP.get(str(tbl).strip().lower())
 
 # ==============================================================================
 # PRESET BUSINESS SQL QUERIES (FOR 1-CLICK QUERY RUNNER)
@@ -170,6 +174,13 @@ ORDER BY shipments_count DESC;"""
 # WEB & API ROUTES
 # ==============================================================================
 
+@app.after_request
+def add_no_cache_headers(response):
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -262,10 +273,10 @@ def get_tables():
 
 @app.route("/api/table/<table_name>", methods=["GET"])
 def get_table_data(table_name):
-    # Sanitize table name against known tables
-    valid_tables = [t["name"] for t in db.get_table_metadata()]
-    if table_name not in valid_tables:
+    canonical = get_valid_table_name(table_name)
+    if not canonical:
         return jsonify({"success": False, "error": f"Invalid table: {table_name}"}), 400
+    table_name = canonical
 
     limit = request.args.get("limit", 50, type=int)
     offset = request.args.get("offset", 0, type=int)
@@ -273,7 +284,6 @@ def get_table_data(table_name):
 
     query = f"SELECT * FROM {table_name}"
     if search:
-        # Fetch columns first
         meta = db.execute_raw_query(f"SELECT * FROM {table_name} LIMIT 1")
         if meta.get("columns"):
             where_clauses = [f"CAST({col} AS TEXT) LIKE '%{search}%'" for col in meta["columns"]]
@@ -299,38 +309,38 @@ def get_lookups():
 
 @app.route("/api/schema/<table_name>", methods=["GET"])
 def get_schema(table_name):
-    valid_tables = [t["name"] for t in db.get_table_metadata()]
-    if table_name not in valid_tables:
+    canonical = get_valid_table_name(table_name)
+    if not canonical:
         return jsonify({"success": False, "error": f"Invalid table: {table_name}"}), 400
-    return jsonify(db.get_table_schema(table_name))
+    return jsonify(db.get_table_schema(canonical))
 
 @app.route("/api/records/<table_name>", methods=["POST"])
 def create_record(table_name):
-    valid_tables = [t["name"] for t in db.get_table_metadata()]
-    if table_name not in valid_tables:
+    canonical = get_valid_table_name(table_name)
+    if not canonical:
         return jsonify({"success": False, "error": f"Invalid table: {table_name}"}), 400
 
     data = request.get_json(force=True, silent=True) or {}
-    res = db.insert_row(table_name, data)
+    res = db.insert_row(canonical, data)
     return jsonify(res), (200 if res.get("success") else 400)
 
 @app.route("/api/records/<table_name>/<pk_value>", methods=["PUT"])
 def update_record(table_name, pk_value):
-    valid_tables = [t["name"] for t in db.get_table_metadata()]
-    if table_name not in valid_tables:
+    canonical = get_valid_table_name(table_name)
+    if not canonical:
         return jsonify({"success": False, "error": f"Invalid table: {table_name}"}), 400
 
     data = request.get_json(force=True, silent=True) or {}
-    res = db.update_row(table_name, pk_value, data)
+    res = db.update_row(canonical, pk_value, data)
     return jsonify(res), (200 if res.get("success") else 400)
 
 @app.route("/api/records/<table_name>/<pk_value>", methods=["DELETE"])
 def delete_record(table_name, pk_value):
-    valid_tables = [t["name"] for t in db.get_table_metadata()]
-    if table_name not in valid_tables:
+    canonical = get_valid_table_name(table_name)
+    if not canonical:
         return jsonify({"success": False, "error": f"Invalid table: {table_name}"}), 400
 
-    res = db.delete_row(table_name, pk_value)
+    res = db.delete_row(canonical, pk_value)
     return jsonify(res), (200 if res.get("success") else 400)
 
 if __name__ == "__main__":
@@ -339,5 +349,5 @@ if __name__ == "__main__":
     print(" [AETHELGARD LEATHERWORKS] BUSINESS DATA MANAGEMENT DASHBOARD")
     print(f" Server launching on: http://0.0.0.0:{port}")
     print("="*70 + "\n")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
 
